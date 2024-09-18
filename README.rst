@@ -1,8 +1,10 @@
 |pipeline status| |coverage report| |pypi| |conda| |version|
 
 =====
-Bilby
+Bilby development has moved to `GitHub <https://github.com/bilby-dev/bilby>`__!
 =====
+Please open any new issues or pull requests there. A full migration guide will be provided soon. Links below here may no longer be active.
+====
 
 A user-friendly Bayesian inference library.
 Fulfilling all your Bayesian dreams.
