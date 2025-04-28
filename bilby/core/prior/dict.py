@@ -828,10 +828,17 @@ class ConditionalPriorDict(PriorDict):
 
         """
         self._prepare_evaluation(*zip(*sample.items()))
-        res = [
-            self[key].ln_prob(sample[key], **self.get_required_variables(key))
-            for key in sample
-        ]
+        #res = [
+        #    self[key].ln_prob(sample[key], **self.get_required_variables(key))
+        #    for key in sample
+        #]
+        res = []
+        for key in sample:
+            data = self[key].ln_prob(sample[key], **self.get_required_variables(key))
+            print(key, len(data))
+            res.append(data)
+        
+        print(len(res))
         ln_prob = np.sum(res, axis=axis)
         return self.check_ln_prob(sample, ln_prob,
                                   normalized=normalized)

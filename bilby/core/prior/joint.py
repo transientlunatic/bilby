@@ -742,6 +742,8 @@ class JointPrior(Prior):
             See superclass
         """
         if not isinstance(dist, BaseJointPriorDist):
+        #if BaseJointPriorDist not in dist.__class__.__mro__:
+
             raise TypeError(
                 "Must supply a JointPriorDist object instance to be shared by all joint params"
             )
