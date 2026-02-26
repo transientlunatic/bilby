@@ -4,11 +4,16 @@ import os
 import dill
 import numpy as np
 from astropy import constants
+import importlib
 import lal
+import logging
 import matplotlib.pyplot as plt
 import h5py
 import json
 import pytest
+import sys
+import types
+import warnings
 
 import bilby
 from bilby.core import utils
@@ -470,6 +475,10 @@ class TestSavingNumpyRandomGenerator(unittest.TestCase):
 
 class TestGlobalMetaData(unittest.TestCase):
 
+    @pytest.fixture(autouse=True)
+    def set_caplog(self, caplog):
+        self._caplog = caplog
+
     def setUp(self):
         global_meta_data.clear()
         global_meta_data["rng"] = bilby.core.utils.random.rng
@@ -494,6 +503,67 @@ class TestGlobalMetaData(unittest.TestCase):
     def test_set_cosmology(self):
         bilby.gw.cosmology.set_cosmology("Planck15_LAL")
         self.assertTrue(global_meta_data["cosmology"] is bilby.gw.cosmology.COSMOLOGY[0])
+
+    def test_update(self):
+        bilby.core.utils.meta_data.logger.propagate = True
+        with self._caplog.at_level(logging.DEBUG, logger="bilby"):
+            global_meta_data.update({"test": 123})
+        assert "Setting meta data key test with value 123" in str(self._caplog.text)
+
+    def test_init(self):
+        bilby.core.utils.meta_data.logger.propagate = True
+        with self._caplog.at_level(logging.DEBUG, logger="bilby"):
+            bilby.core.utils.GlobalMetaData({"test": 123})
+        assert "Setting meta data key test with value 123" in str(self._caplog.text)
+        assert "GlobalMetaData has already been instantiated" in str(self._caplog.text)
+
+
+class TestRandomUtils(unittest.TestCase):
+
+    def setUp(self):
+        # Ensure a clean import of the random module
+        if "bilby.core.utils.random" in sys.modules:
+            importlib.reload(sys.modules["bilby.core.utils.random"])
+
+    def tearDown(self):
+        # Reload the module to restore default state after each test
+        if "bilby.core.utils.random" in sys.modules:
+            importlib.reload(sys.modules["bilby.core.utils.random"])
+
+    def test_no_warning_when_accessed_via_module(self):
+        from bilby.core.utils import random
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            random.seed(42)
+
+        for warning in w:
+            self.assertNotIn("Detected that `rng` was likely imported directly", str(warning.message))
+
+    def test_warning_when_imported_directly(self):
+        from bilby.core.utils.random import rng
+        from bilby.core.utils import random
+
+        # Simulate direct import of rng in a fake module
+        fake_module = types.ModuleType("fake_module")
+        fake_module.rng = rng
+        sys.modules["fake_module"] = fake_module
+
+        try:
+            with self.assertWarnsRegex(RuntimeWarning, "Detected that `rng` was likely imported directly"):
+                random.seed(123)
+        finally:
+            # always clean up the fake module even if the test fails
+            del sys.modules["fake_module"]
+
+    def test_rng_is_updated_after_seed(self):
+        from bilby.core.utils import random
+
+        old_rng = random.rng
+        random.seed(123)
+        new_rng = random.rng
+
+        self.assertIsNot(old_rng, new_rng)
 
 
 if __name__ == "__main__":

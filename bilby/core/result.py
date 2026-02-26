@@ -13,6 +13,7 @@ import pandas as pd
 import scipy.stats
 
 from . import utils
+from .likelihood import _safe_likelihood_call
 from .utils import (
     logger, infer_parameters_from_function,
     check_directory_exists_and_if_not_mkdir,
@@ -25,16 +26,12 @@ from .utils import (
     recursively_decode_bilby_json,
     safe_file_dump,
     random,
+    string_to_boolean,
 )
 from .prior import Prior, PriorDict, DeltaFunction, ConditionalDeltaFunction
 
 
 EXTENSIONS = ["json", "hdf5", "h5", "pickle", "pkl"]
-
-
-def __eval_l(likelihood, params):
-    likelihood.parameters.update(params)
-    return likelihood.log_likelihood()
 
 
 def result_file_name(outdir, label, extension='json', gzip=False):
@@ -81,7 +78,7 @@ def _determine_file_name(filename, outdir, label, extension, gzip):
             return result_file_name(outdir, label, extension, gzip)
 
 
-def read_in_result(filename=None, outdir=None, label=None, extension='json', gzip=False, result_class=None):
+def read_in_result(filename=None, outdir=None, label=None, extension=None, gzip=False, result_class=None):
     """ Reads in a stored bilby result object
 
     Parameters
@@ -91,12 +88,18 @@ def read_in_result(filename=None, outdir=None, label=None, extension='json', gzi
     outdir, label, extension: str
         Name of the output directory, label and extension used for the default
         naming scheme.
+    extension: str, optional
+        The file extension to use. If not given, the extension is inferred from
+        the filename if provided. If the filename is not given, defaults to
+        'json'.
     result_class: bilby.core.result.Result, or child of
         The result class to use. By default, `bilby.core.result.Result` is used,
         but objects which inherit from this class can be given providing
         additional methods.
     """
-    filename = _determine_file_name(filename, outdir, label, extension, gzip)
+    filename = _determine_file_name(
+        filename, outdir, label, extension or "json", gzip
+    )
 
     if result_class is None:
         result_class = Result
@@ -104,20 +107,48 @@ def read_in_result(filename=None, outdir=None, label=None, extension='json', gzi
         raise ValueError(f"Input result_class={result_class} not understood")
 
     # Get the actual extension (may differ from the default extension if the filename is given)
-    extension = os.path.splitext(filename)[1].lstrip('.')
+    if extension is None:
+        ext = os.path.splitext(filename)[1][1:]
+        extension = ext if ext else None
     if extension == 'gz':  # gzipped file
         extension = os.path.splitext(os.path.splitext(filename)[0])[1].lstrip('.')
 
-    if 'json' in extension:
-        result = result_class.from_json(filename=filename)
-    elif ('hdf5' in extension) or ('h5' in extension):
-        result = result_class.from_hdf5(filename=filename)
-    elif ("pkl" in extension) or ("pickle" in extension):
-        result = result_class.from_pickle(filename=filename)
-    elif extension is None:
-        raise ValueError("No filetype extension provided")
-    else:
-        raise ValueError("Filetype {} not understood".format(extension))
+    if extension is None:
+        raise ValueError("No filetype extension provided and could not be inferred from filename")
+
+    extension = extension.lower()
+    read_functions = {
+        'json': result_class.from_json,
+        'hdf5': result_class.from_hdf5,
+        'h5': result_class.from_hdf5,
+        'pkl': result_class.from_pickle,
+        'pickle': result_class.from_pickle,
+    }
+    if extension not in read_functions:
+        raise ValueError(
+            f"Filetype {extension} not understood, known types are {list(read_functions.keys())}"
+        )
+
+    func = read_functions[extension]
+
+    # Raise IO errors since this is what the caching relies on
+    # Catch all other exceptions and raise a FileLoadError
+    try:
+        result = func(filename=filename)
+    except IOError as e:
+        raise IOError(
+            f"Failed to read in file {filename} using "
+            f"`{result_class.__name__}.{func.__name__}` "
+            f"(extension={extension}). "
+            "This is likely because the file does not exist or is not a valid bilby result."
+            f"The error was: {e}"
+        ) from e
+    except Exception as e:
+        raise FileLoadError(
+            f"Failed to read in file {filename} using "
+            f"`{result_class.__name__}.{func.__name__}` "
+            f"(extension={extension}). The error was: {e}"
+        ) from e
     return result
 
 
@@ -187,20 +218,22 @@ def get_weights_for_reweighting(
 
     nposterior = len(result.posterior)
 
+    old_log_likelihood_array = np.zeros(nposterior)
+    old_log_prior_array = np.zeros(nposterior)
+    new_log_likelihood_array = np.zeros(nposterior)
+    new_log_prior_array = np.zeros(nposterior)
+
+    starting_index = 0
+
     if (resume_file is not None) and os.path.exists(resume_file):
         old_log_likelihood_array, old_log_prior_array, new_log_likelihood_array, new_log_prior_array = \
             np.genfromtxt(resume_file)
 
         starting_index = np.argmin(np.abs(old_log_likelihood_array))
         logger.info(f'Checkpoint resuming from {starting_index}.')
-
-    else:
-        old_log_likelihood_array = np.zeros(nposterior)
-        old_log_prior_array = np.zeros(nposterior)
-        new_log_likelihood_array = np.zeros(nposterior)
-        new_log_prior_array = np.zeros(nposterior)
-
-        starting_index = 0
+    elif resume_file is not None:
+        basedir = os.path.split(resume_file)[0]
+        check_directory_exists_and_if_not_mkdir(basedir)
 
     dict_samples = [{key: sample[key] for key in result.posterior}
                     for _, sample in result.posterior.iterrows()]
@@ -211,7 +244,7 @@ def get_weights_for_reweighting(
         with multiprocessing.Pool(processes=npool) as pool:
             chunksize = max(100, n // (2 * npool))
             return list(tqdm(
-                pool.imap(partial(__eval_l, this_logl),
+                pool.imap(partial(_safe_likelihood_call, this_logl),
                         dict_samples[starting_index:], chunksize=chunksize),
                 desc='Computing likelihoods',
                 total=n)
@@ -502,6 +535,18 @@ class Result(object):
         self.prior_values = None
         self._kde = None
 
+        if not string_to_boolean(os.getenv("BILBY_INCLUDE_GLOBAL_META_DATA", "False")):
+            gmd = self.meta_data.pop("global_meta_data", None)
+            if gmd is not None:
+                logger.info(
+                    "Global meta data was removed from the result object for compatibility. "
+                    "Use the `BILBY_INCLUDE_GLOBAL_METADATA` environment variable to include it. "
+                    "This behaviour will be removed in a future release. "
+                    "For more details see: https://bilby-dev.github.io/bilby/faq.html#global-meta-data"
+                )
+        else:
+            logger.debug("Including global meta data in the result object.")
+
     _load_doctstring = """ Read in a saved .{format} data file
 
     Parameters
@@ -753,9 +798,8 @@ class Result(object):
         return dictionary
 
     def save_to_file(self, filename=None, overwrite=False, outdir=None,
-                     extension='json', gzip=False):
+                     extension=None, gzip=False):
         """
-
         Writes the Result to a file.
 
         Supported formats are: `json`, `hdf5`, `pickle`
@@ -763,29 +807,58 @@ class Result(object):
         Parameters
         ==========
         filename: optional,
-            Filename to write to (overwrites the default)
+            Filename to write to (overwrites the default). Assumed to include the
+            file extension.
         overwrite: bool, optional
             Whether or not to overwrite an existing result file.
             default=False
         outdir: str, optional
             Path to the outdir. Default is the one stored in the result object.
             If given, overwrite path prefix in 'filename'.
-        extension: str, optional {json, hdf5, pkl, pickle, True}
-            Determines the method to use to store the data (if True defaults
-            to json)
+        extension: {"json", "hdf5", "pkl", None}, optional
+            Determines the method to use to store the data. If None, the extension
+            is inferred from the filename if provided, otherwise defaults to 'json'.
         gzip: bool, optional
             If true, and outputting to a json file, this will gzip the resulting
             file and add '.gz' to the file extension.
         """
 
-        if extension is True:
-            extension = "json"
-
         _outdir = None
         if filename is not None:
+            # Overwrite the full filename with the base filename
+            # Well append the outdir later on
             _outdir, filename = os.path.split(filename)
             _outdir = None if _outdir == "" else _outdir
-            filename = f"{os.path.splitext(filename)[0]}.{extension}"
+            _, ext = os.path.splitext(filename)
+            ext = ext[1:] if ext else None
+            # If the extension has not been set, try to infer it from the filename
+            # if not, it will fall back to the default
+            if ext in EXTENSIONS:
+                if extension is None:
+                    logger.debug(
+                        f"Inferred extension '{ext}' from filename '{filename}'. "
+                        "Using this extension for saving."
+                    )
+                    extension = ext
+                elif ext != extension:
+                    message = (
+                        f"The specified extension '{ext}' "
+                        f"does not match the provided extension '{extension}'. "
+                    )
+                    logger.warning(message)
+
+        if extension is None:
+            logger.info("No extension given, defaulting to JSON.")
+            extension = 'json'
+
+        if extension is True:
+            message = (
+                "Result.save_to_file called with extension=True. "
+                "This will default to json, and ignore the extension from the filename. "
+                "This behaviour is deprecated and will be removed. "
+            )
+            logger.warning(message)
+            extension = 'json'
 
         outdir = _outdir if outdir is None else outdir
         outdir = self._safe_outdir_creation(outdir, self.save_to_file)
@@ -818,22 +891,22 @@ class Result(object):
                 else:
                     with open(output_path, 'w') as file:
                         json.dump(dictionary, file, indent=2, cls=BilbyJsonEncoder)
-            elif extension == 'hdf5':
+            elif extension in ['hdf5', 'h5']:
                 import h5py
                 dictionary["__module__"] = self.__module__
                 dictionary["__name__"] = self.__class__.__name__
                 with h5py.File(output_path, 'w') as h5file:
                     recursively_save_dict_contents_to_group(h5file, '/', dictionary)
-            elif extension == 'pkl':
+            elif extension in ['pkl', 'pickle']:
                 safe_file_dump(self, output_path, "dill")
             else:
-                raise ValueError("Extension type {} not understood".format(extension))
+                raise ValueError(f"Extension type {extension} not understood")
         except Exception as e:
             output_path = f"{os.path.splitext(output_path)[0]}.pkl"
             safe_file_dump(self, output_path, "dill")
             logger.error(
                 "\n\nSaving the data has failed with the following message:\n"
-                "{}\nData has been dumped to {}.\n\n".format(e, output_path)
+                f"{e}\nData has been dumped to {output_path}.\n\n"
             )
 
     def save_posterior_samples(self, filename=None, outdir=None, label=None):
@@ -1533,8 +1606,7 @@ class Result(object):
         if keys is None:
             keys = self.search_parameter_keys
         if self.injection_parameters is None:
-            raise (
-                TypeError,
+            raise TypeError(
                 "Result object has no 'injection_parameters'. "
                 "Cannot compute credible levels."
             )
@@ -2014,8 +2086,8 @@ class ResultList(list):
 @latex_plot_format
 def plot_multiple(results, filename=None, labels=None, colours=None,
                   save=True, evidences=False, corner_labels=None, linestyles=None,
-                  **kwargs):
-    """ Generate a corner plot overlaying two sets of results
+                  fig=None, **kwargs):
+    """Generate a corner plot overlaying two sets of results
 
     Parameters
     ==========
@@ -2038,12 +2110,19 @@ def plot_multiple(results, filename=None, labels=None, colours=None,
         for the keyword `labels` for which you should use the dedicated
         `corner_labels` input).
         However, `show_titles` and `truths` are ignored since they would be
-        ambiguous on such a plot.
+        ambiguous on such a plot. The keyword arguments `contour_kwargs["linestyles"]`,
+        `contour_kwargs['colors']`, `hist_kwargs["linestyle"]`, `color` and
+        `hist_kwargs["color"]` are overwritten with the values provided in the
+        `colours` and `linestyles` inputs or by the default styles.
     evidences: bool, optional
         Add the log-evidence calculations to the legend. If available, the
         Bayes factor will be used instead.
     corner_labels: list, optional
         List of strings to be passed to the input `labels` to `result.plot_corner`.
+    linestyles: list, optional
+        List of linestyle strings to plot the results with.
+    fig: figure, optional
+        Figure onto which the results are plotted.
 
     Returns
     =======
@@ -2058,8 +2137,6 @@ def plot_multiple(results, filename=None, labels=None, colours=None,
     kwargs['truths'] = None
     if corner_labels is not None:
         kwargs['labels'] = corner_labels
-
-    fig = results[0].plot_corner(save=False, **kwargs)
     default_filename = '{}/{}'.format(results[0].outdir, 'combined')
     lines = []
     default_labels = []
@@ -2072,11 +2149,15 @@ def plot_multiple(results, filename=None, labels=None, colours=None,
             linestyle = linestyles[i]
         else:
             linestyle = 'solid'
-        hist_kwargs = kwargs.get('hist_kwargs', dict())
-        hist_kwargs['color'] = c
+        hist_kwargs = kwargs.get("hist_kwargs", dict())
+        contour_kwargs = kwargs.get("contour_kwargs", dict())
+        hist_kwargs["color"] = c
         hist_kwargs["linestyle"] = linestyle
+        contour_kwargs["colors"] = c
+        contour_kwargs["linestyles"] = linestyle
         kwargs["hist_kwargs"] = hist_kwargs
-        fig = result.plot_corner(fig=fig, save=False, color=c, contour_kwargs={"linestyles": linestyle}, **kwargs)
+        kwargs["contour_kwargs"] = contour_kwargs
+        fig = result.plot_corner(fig=fig, save=False, color=c, **kwargs)
         default_filename += '_{}'.format(result.label)
         lines.append(mpllines.Line2D([0], [0], color=c, linestyle=linestyle))
         default_labels.append(result.label)
@@ -2261,3 +2342,7 @@ class ResultListError(ResultError):
 
 class FileMovedError(ResultError):
     """ Exceptions that occur when files have been moved """
+
+
+class FileLoadError(ResultError):
+    """ Exceptions that occur when files cannot be loaded """
