@@ -12,8 +12,44 @@ class Minuit(Sampler):
     optionally HESSE for Hessian-based covariance, and optionally MINOS for
     profile-likelihood confidence intervals.
 
-    "Samples" stored in the result are drawn from the multivariate Gaussian
-    approximation centred on the best-fit point with the HESSE covariance.
+    Unlike Bayesian samplers (e.g. dynesty, emcee), this sampler does *not*
+    explore the full posterior distribution.  Instead it finds the
+    maximum-likelihood estimate (MLE) and characterises the uncertainty around
+    that point via a local Gaussian (HESSE covariance) or via profile
+    likelihoods (MINOS).  The ``posterior`` stored in the bilby result is
+    therefore a multivariate-Gaussian approximation centred on the MLE, not a
+    true posterior.
+
+    Frequentist results are stored in ``result.meta_data``:
+
+    * ``best_fit``            – dict of MLE parameter values.
+    * ``migrad_valid``        – whether MIGRAD converged.
+    * ``migrad_accurate``     – whether MIGRAD is accurate (covariance valid).
+    * ``migrad_fval``         – value of -2*log(L) at the minimum.
+    * ``migrad_nfcn``         – number of likelihood evaluations used by MIGRAD.
+    * ``hesse_covariance``    – covariance matrix (ndim × ndim numpy array).
+    * ``hesse_errors``        – dict of symmetric 1-σ errors from HESSE.
+    * ``minos_errors``        – dict of ``{param: (lower, upper)}`` asymmetric
+                                1-σ errors from MINOS profile likelihood.
+    * ``profiles``            – dict of ``{param: {'values': array,
+                                'log_likelihood': array}}`` giving the
+                                profile-likelihood curve for each parameter
+                                (only present when ``compute_profiles=True``).
+
+    Warm-starting from a previous bilby result
+    -------------------------------------------
+    If you have already run a Bayesian sampler (e.g. dynesty) and want to
+    initialise MIGRAD near the posterior maximum, pass the path to the existing
+    result file via ``start_from_result``::
+
+        result = bilby.run_sampler(
+            likelihood, priors, sampler="minuit",
+            start_from_result="outdir/label_result.json",
+        )
+
+    The sample with the highest log-likelihood in the previous result is used
+    as the starting point.  This is particularly effective when the Bayesian
+    run has already located the likelihood peak, saving MIGRAD function calls.
 
     Parameters
     ==========
@@ -26,6 +62,19 @@ class Minuit(Sampler):
     run_minos : bool
         If True (default: False), run MINOS after HESSE to compute
         profile-likelihood confidence intervals.  Requires ``run_hesse=True``.
+    compute_profiles : bool
+        If True (default: False), compute the profile-likelihood curve for
+        every search parameter after running MINOS (or HESSE if MINOS is not
+        requested) and store the results in ``result.meta_data['profiles']``.
+        Requires ``run_hesse=True``.
+    profile_size : int
+        Number of scan points for each profile-likelihood curve when
+        ``compute_profiles=True`` (default: 100).
+    start_from_result : str or bilby.core.result.Result or None
+        Path to a bilby result file (or a :class:`bilby.core.result.Result`
+        object) whose highest-likelihood sample is used as the starting point
+        for MIGRAD.  Useful for warm-starting from a previous Bayesian run
+        (default: None, starting values are taken from the prior medians).
     migrad_ncall : int or None
         Maximum number of function calls for MIGRAD (default: None, iminuit
         chooses automatically).
@@ -49,6 +98,9 @@ class Minuit(Sampler):
         nsamples=1000,
         run_hesse=True,
         run_minos=False,
+        compute_profiles=False,
+        profile_size=100,
+        start_from_result=None,
         migrad_ncall=None,
         minos_ncall=None,
         tol=None,
@@ -83,7 +135,8 @@ class Minuit(Sampler):
         """
         import iminuit
 
-        # Build the initial parameter values from the prior means/modes.
+        # Build the initial parameter values from the prior means/modes,
+        # optionally warm-started from a previous bilby result.
         x0 = np.array(
             [
                 self._initial_value(key)
@@ -138,6 +191,25 @@ class Minuit(Sampler):
                 for key in self._search_parameter_keys
                 if key in m.merrors
             }
+
+        # ── Profile likelihoods ──────────────────────────────────────────────
+        profiles = None
+        if self.kwargs["compute_profiles"] and self.kwargs["run_hesse"]:
+            profiles = {}
+            size = self.kwargs["profile_size"]
+            for key in self._search_parameter_keys:
+                try:
+                    x_vals, fvals, valid = m.mnprofile(key, size=size)
+                    # Convert from FCN values to log-likelihood relative to max.
+                    # FCN = -2 * log(L), so log(L) = -FCN/2.
+                    # Profile log-likelihood ratio: Δlog(L) = -(fval - fmin)/2
+                    logl = -(np.array(fvals) - m.fval) / 2
+                    profiles[key] = {
+                        "values": np.array(x_vals),
+                        "log_likelihood": logl,
+                    }
+                except Exception:
+                    pass
 
         # ── Collect best-fit values ──────────────────────────────────────────
         best_fit = {
@@ -207,6 +279,9 @@ class Minuit(Sampler):
         if minos_errors is not None:
             self.result.meta_data["minos_errors"] = minos_errors
 
+        if profiles is not None:
+            self.result.meta_data["profiles"] = profiles
+
         self.calc_likelihood_count()
         return self.result
 
@@ -215,6 +290,7 @@ class Minuit(Sampler):
         self.kwargs["migrad_ncall"] = 10
         self.kwargs["run_hesse"] = False
         self.kwargs["run_minos"] = False
+        self.kwargs["compute_profiles"] = False
         self.kwargs["nsamples"] = 10
         return self.run_sampler()
 
@@ -227,9 +303,17 @@ class Minuit(Sampler):
     def _initial_value(self, key):
         """Return a sensible starting value for parameter *key*.
 
-        Uses the prior median (``rescale(0.5)``) when finite, otherwise falls
-        back to 0.
+        If ``start_from_result`` is set, the highest-likelihood sample from
+        that result is used.  Otherwise, the prior median (``rescale(0.5)``)
+        is used when finite, falling back to 0.
         """
+        # Warm-start from a previously saved result.
+        warm_start = self.kwargs.get("start_from_result")
+        if warm_start is not None:
+            val = self._warm_start_values.get(key)
+            if val is not None and np.isfinite(val):
+                return float(val)
+
         prior = self.priors[key]
         try:
             val = float(prior.rescale(0.5))
@@ -238,6 +322,63 @@ class Minuit(Sampler):
         if not np.isfinite(val):
             val = 0.0
         return val
+
+    @property
+    def _warm_start_values(self):
+        """Dict of parameter → value from the warm-start result (cached)."""
+        if not hasattr(self, "_warm_start_values_cache"):
+            self._warm_start_values_cache = self._load_warm_start_values()
+        return self._warm_start_values_cache
+
+    def _load_warm_start_values(self):
+        """Load the MAP sample from the warm-start result file or object."""
+        from ..utils import logger as _logger
+
+        warm_start = self.kwargs.get("start_from_result")
+        if warm_start is None:
+            return {}
+
+        from ..result import read_in_result, Result
+
+        if isinstance(warm_start, str):
+            try:
+                prior_result = read_in_result(filename=warm_start)
+            except Exception as e:
+                _logger.warning(
+                    f"Could not load warm-start result from '{warm_start}': {e}. "
+                    "Falling back to prior medians."
+                )
+                return {}
+        elif isinstance(warm_start, Result):
+            prior_result = warm_start
+        else:
+            _logger.warning(
+                "start_from_result must be a file path string or a "
+                "bilby.core.result.Result object. "
+                "Falling back to prior medians."
+            )
+            return {}
+
+        # Pick the highest-likelihood sample as the starting point.
+        posterior = prior_result.posterior
+        if "log_likelihood" in posterior.columns:
+            map_row = posterior.iloc[posterior["log_likelihood"].idxmax()]
+        else:
+            _logger.warning(
+                "Warm-start result has no 'log_likelihood' column; "
+                "using the first sample as starting point."
+            )
+            map_row = posterior.iloc[0]
+
+        _logger.info(
+            "Warm-starting MIGRAD from maximum-likelihood sample in "
+            f"'{warm_start}'."
+        )
+        return {
+            k: float(map_row[k])
+            for k in self._search_parameter_keys
+            if k in map_row.index
+        }
 
     def _prior_limits(self, key):
         """Return an (lower, upper) limit tuple for parameter *key*.

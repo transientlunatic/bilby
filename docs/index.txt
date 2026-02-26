@@ -18,6 +18,7 @@ Welcome to bilby's documentation!
    samplers
    dynesty-guide
    bilby-mcmc-guide
+   minuit-guide
    rng
    parameters
    plugins

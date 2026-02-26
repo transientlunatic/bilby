@@ -79,6 +79,18 @@ MCMC samplers
 - pymc :code:`bilby.core.sampler.pymc.Pymc`
 - zeus :code:`bilby.core.sampler.zeus.Zeus`
 
+-------------------------------
+Frequentist / MLE samplers
+-------------------------------
+
+- Minuit :code:`bilby.core.sampler.minuit.Minuit`
+
+  The :code:`minuit` sampler finds the maximum-likelihood estimate (MLE)
+  using MIGRAD and can compute Hessian-based errors (HESSE) or
+  profile-likelihood confidence intervals (MINOS).  See :ref:`minuit-guide`
+  for a detailed guide including warm-starting from Bayesian results and
+  extracting profile likelihoods.
+
 --------------------------
 Listing available samplers
 --------------------------
