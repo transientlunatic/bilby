@@ -204,13 +204,20 @@ class Minuit(Sampler):
         # ── MINOS ───────────────────────────────────────────────────────────
         minos_errors = None
         if self.kwargs["run_minos"] and self.kwargs["run_hesse"]:
-            minos_ncall = self.kwargs["minos_ncall"]
-            m.minos(ncall=minos_ncall)
-            minos_errors = {
-                key: (m.merrors[key].lower, m.merrors[key].upper)
-                for key in self._search_parameter_keys
-                if key in m.merrors
-            }
+            if not m.valid:
+                from ..utils import logger as _logger
+                _logger.warning(
+                    "Skipping MINOS because the function minimum is not valid "
+                    "(MIGRAD did not converge). MINOS requires a valid minimum."
+                )
+            else:
+                minos_ncall = self.kwargs["minos_ncall"]
+                m.minos(ncall=minos_ncall)
+                minos_errors = {
+                    key: (m.merrors[key].lower, m.merrors[key].upper)
+                    for key in self._search_parameter_keys
+                    if key in m.merrors
+                }
 
         # ── Profile likelihoods ──────────────────────────────────────────────
         profiles = None
