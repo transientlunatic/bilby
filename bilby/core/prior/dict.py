@@ -455,10 +455,17 @@ class PriorDict(dict):
         n_tested_samples, n_valid_samples = 0, 0
         if size is None or size == 1:
             while True:
-                sample = self.sample_subset(keys=keys, size=size)
+                # Use size=None here so each prior returns a Python scalar
+                # rather than a 1-element array.  This guarantees that
+                # evaluate_constraints (and any conversion_function called
+                # inside it) sees scalar inputs and returns a scalar bool /
+                # float rather than a 1-d array, avoiding the
+                # "only 0-d arrays can be converted to Python scalars" error
+                # from int() below.
+                sample = self.sample_subset(keys=keys, size=None)
                 is_valid = self.evaluate_constraints(sample)
                 n_tested_samples += 1
-                n_valid_samples += int(is_valid)
+                n_valid_samples += int(bool(is_valid))
                 check_efficiency(n_tested_samples, n_valid_samples)
                 if is_valid:
                     return sample
