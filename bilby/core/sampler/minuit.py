@@ -222,6 +222,12 @@ class Minuit(Sampler):
         # ── Profile likelihoods ──────────────────────────────────────────────
         profiles = None
         if self.kwargs["compute_profiles"] and self.kwargs["run_hesse"]:
+            from ..utils import logger as _logger
+            if not m.valid:
+                _logger.warning(
+                    "Function minimum is not valid; profile likelihoods may be "
+                    "unreliable.  Attempting anyway."
+                )
             profiles = {}
             size = self.kwargs["profile_size"]
             profile_params = self.kwargs["profile_parameters"]
@@ -230,7 +236,6 @@ class Minuit(Sampler):
             else:
                 unknown = [p for p in profile_params if p not in self._search_parameter_keys]
                 if unknown:
-                    from ..utils import logger as _logger
                     _logger.warning(
                         f"profile_parameters contains keys not in search parameters: {unknown}. "
                         "They will be ignored."
@@ -247,8 +252,11 @@ class Minuit(Sampler):
                         "values": np.array(x_vals),
                         "log_likelihood": logl,
                     }
-                except Exception:
-                    pass
+                    _logger.info(f"Profile likelihood computed for {key}.")
+                except Exception as e:
+                    _logger.warning(
+                        f"Profile likelihood computation failed for {key}: {e}"
+                    )
 
         # ── Collect best-fit values ──────────────────────────────────────────
         best_fit = {
@@ -329,7 +337,7 @@ class Minuit(Sampler):
         if minos_errors is not None:
             self.result.meta_data["minos_errors"] = minos_errors
 
-        if profiles is not None:
+        if profiles:
             self.result.meta_data["profiles"] = profiles
 
         self.calc_likelihood_count()
