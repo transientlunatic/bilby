@@ -64,9 +64,15 @@ class Minuit(Sampler):
         profile-likelihood confidence intervals.  Requires ``run_hesse=True``.
     compute_profiles : bool
         If True (default: False), compute the profile-likelihood curve for
-        every search parameter after running MINOS (or HESSE if MINOS is not
-        requested) and store the results in ``result.meta_data['profiles']``.
-        Requires ``run_hesse=True``.
+        the parameters listed in ``profile_parameters`` (or all search
+        parameters when ``profile_parameters`` is None) and store the results
+        in ``result.meta_data['profiles']``.  Requires ``run_hesse=True``.
+    profile_parameters : list of str or None
+        Subset of search parameter names for which to compute
+        profile-likelihood curves when ``compute_profiles=True``.  If None
+        (default), profiles are computed for every search parameter.  Use
+        this to limit expensive profile computations to only the parameters of
+        interest, e.g. ``profile_parameters=["chirp_mass", "luminosity_distance"]``.
     profile_size : int
         Number of scan points for each profile-likelihood curve when
         ``compute_profiles=True`` (default: 100).
@@ -99,6 +105,7 @@ class Minuit(Sampler):
         run_hesse=True,
         run_minos=False,
         compute_profiles=False,
+        profile_parameters=None,
         profile_size=100,
         start_from_result=None,
         migrad_ncall=None,
@@ -120,7 +127,20 @@ class Minuit(Sampler):
             )
 
     def _neg_log_likelihood(self, theta):
-        """Return the negative log-likelihood for minimisation."""
+        """Return the negative log-likelihood for minimisation.
+
+        Clips ``theta`` to the prior bounds before evaluating so that
+        numerical steps taken by iminuit (during MIGRAD, HESSE, MINOS, or
+        mnprofile) that land infinitesimally outside a hard bound (e.g.
+        ``chi_2 = -1e-16``) do not raise errors in the waveform generator.
+        """
+        theta = np.array(theta, dtype=float)
+        for i, key in enumerate(self._search_parameter_keys):
+            lo, hi = self._prior_limits(key)
+            if lo is not None:
+                theta[i] = max(theta[i], lo)
+            if hi is not None:
+                theta[i] = min(theta[i], hi)
         return -self.log_likelihood(theta)
 
     @signal_wrapper
@@ -197,7 +217,19 @@ class Minuit(Sampler):
         if self.kwargs["compute_profiles"] and self.kwargs["run_hesse"]:
             profiles = {}
             size = self.kwargs["profile_size"]
-            for key in self._search_parameter_keys:
+            profile_params = self.kwargs["profile_parameters"]
+            if profile_params is None:
+                profile_params = self._search_parameter_keys
+            else:
+                unknown = [p for p in profile_params if p not in self._search_parameter_keys]
+                if unknown:
+                    from ..utils import logger as _logger
+                    _logger.warning(
+                        f"profile_parameters contains keys not in search parameters: {unknown}. "
+                        "They will be ignored."
+                    )
+                profile_params = [p for p in profile_params if p in self._search_parameter_keys]
+            for key in profile_params:
                 try:
                     x_vals, fvals, valid = m.mnprofile(key, size=size)
                     # Convert from FCN values to log-likelihood relative to max.
@@ -249,6 +281,17 @@ class Minuit(Sampler):
         else:
             # No valid covariance: return only the best-fit point replicated.
             samples = np.tile(mean, (nsamples, 1))
+
+        # Clip samples to prior bounds so that parameters with hard physical
+        # limits (e.g. spin magnitudes in [0, 1]) are never passed out-of-range
+        # to the likelihood.
+        for i, key in enumerate(self._search_parameter_keys):
+            lo, hi = self._prior_limits(key)
+            samples[:, i] = np.clip(
+                samples[:, i],
+                lo if lo is not None else -np.inf,
+                hi if hi is not None else np.inf,
+            )
 
         self.result.samples = samples
         self.result.posterior = DataFrame(
