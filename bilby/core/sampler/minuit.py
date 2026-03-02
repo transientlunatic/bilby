@@ -142,6 +142,11 @@ class Minuit(Sampler):
         numerical steps taken by iminuit (during MIGRAD, HESSE, MINOS, or
         mnprofile) that land infinitesimally outside a hard bound (e.g.
         ``chi_2 = -1e-16``) do not raise errors in the waveform generator.
+
+        Any exception raised during likelihood evaluation (e.g. from derived
+        parameter combinations producing NaN or invalid waveform arguments) is
+        caught and returned as a large finite penalty so that iminuit can step
+        away from the bad point rather than crashing.
         """
         theta = np.array(theta, dtype=float)
         for i, key in enumerate(self._search_parameter_keys):
@@ -150,7 +155,10 @@ class Minuit(Sampler):
                 theta[i] = max(theta[i], lo)
             if hi is not None:
                 theta[i] = min(theta[i], hi)
-        return -self.log_likelihood(theta)
+        try:
+            return -self.log_likelihood(theta)
+        except Exception:
+            return np.finfo(float).max / 2
 
     @signal_wrapper
     def run_sampler(self):
