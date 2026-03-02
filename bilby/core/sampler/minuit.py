@@ -89,7 +89,16 @@ class Minuit(Sampler):
         (default: None).
     tol : float or None
         Tolerance passed to iminuit's ``tol`` attribute.  Controls the
-        convergence criterion for MIGRAD (default: None, iminuit default).
+        convergence criterion for MIGRAD via
+        ``EDM_goal = 2e-3 * tol * errordef``.
+        With ``errordef=0.5`` (log-likelihood) that gives
+        ``EDM_goal = 1e-3 * tol``.  iminuit's own default is ``tol=0.1``
+        (``EDM_goal=1e-4``), which is extremely tight for a high-dimensional
+        numerical waveform likelihood and will almost always result in MIGRAD
+        being declared non-converged.  The default here is ``10``
+        (``EDM_goal=0.01``), which matches common practice in HEP fits and is
+        achievable with O(10)-parameter GW likelihoods.  Tighten to ``tol=1``
+        or ``tol=0.1`` if you need higher-precision covariance estimates.
     strategy : int
         iminuit strategy (0=fast, 1=default, 2=careful).  Default: 1.
     print_level : int
@@ -110,7 +119,7 @@ class Minuit(Sampler):
         start_from_result=None,
         migrad_ncall=None,
         minos_ncall=None,
-        tol=None,
+        tol=10.0,
         strategy=1,
         print_level=0,
     )
